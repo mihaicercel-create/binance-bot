@@ -22,7 +22,7 @@ async function initialize() {
       secret: config.apiSecret,
       enableRateLimit: true,
       options: {
-        defaultType: 'spot',
+        defaultType: 'future',
         recvWindow: 60000
       }
     });
