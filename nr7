@@ -1,0 +1,147 @@
+require("dotenv").config();
+const ccxt = require("ccxt");
+const ti = require("technicalindicators");
+const WebSocket = require("ws");
+
+// ===== Binance Futures REST =====
+const exchange = new ccxt.binanceusdm({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+  enableRateLimit: true,
+  options: { defaultType: "future" }
+});
+
+// ===== CONFIG =====
+const SYMBOL_POOL = ["btcusdc","ethusdc","solusdc","bnbusdc"];
+const BASE_LEVERAGE = 6;
+const MAX_LEVERAGE = 12;
+const RISK = 0.05;
+const MAX_POSITIONS = 4;
+let activeTrades = {};
+let peakBalance = 0;
+
+// ===== HELPERS =====
+async function balance() {
+  const b = await exchange.fetchBalance();
+  return b.total.USDC || 0;
+}
+
+function adaptiveLeverage(volScore) {
+  let lev = BASE_LEVERAGE + Math.floor(volScore * 100);
+  return Math.min(lev, MAX_LEVERAGE);
+}
+
+async function positionSize(price, leverage) {
+  const bal = await balance();
+  if (bal > peakBalance) peakBalance = bal;
+  const riskAmount = bal * RISK;
+  return (riskAmount * leverage) / price;
+}
+
+async function openTrade(symbol, side, price, volScore) {
+  if (activeTrades[symbol]) return;
+  const lev = adaptiveLeverage(volScore);
+  await exchange.setLeverage(lev, symbol.toUpperCase());
+  const size = await positionSize(price, lev);
+  if (size <= 0) return;
+  const orderSide = side === "LONG" ? "buy" : "sell";
+  await exchange.createMarketOrder(symbol.toUpperCase(), orderSide, size);
+  activeTrades[symbol] = { side, entry: price, peak: price, size, leverage: lev };
+  console.log(`OPEN ${side} ${symbol.toUpperCase()} lev:${lev}`);
+}
+
+async function closeTrade(symbol) {
+  const trade = activeTrades[symbol];
+  if (!trade) return;
+  const side = trade.side === "LONG" ? "sell" : "buy";
+  await exchange.createMarketOrder(symbol.toUpperCase(), side, trade.size);
+  delete activeTrades[symbol];
+  console.log(`CLOSE ${symbol.toUpperCase()}`);
+}
+
+// ===== TRAILING + PYRAMID =====
+async function manageTrade(symbol, price, atr) {
+  const trade = activeTrades[symbol];
+  if (!trade) return;
+
+  if (trade.side === "LONG" && price > trade.peak) trade.peak = price;
+  if (trade.side === "SHORT" && price < trade.peak) trade.peak = price;
+
+  const trail = atr * 2;
+
+  if (trade.side === "LONG" && price <= trade.peak - trail) await closeTrade(symbol);
+  if (trade.side === "SHORT" && price >= trade.peak + trail) await closeTrade(symbol);
+
+  // Pyramiding
+  if (trade.side === "LONG" && price > trade.entry * 1.04) {
+    await exchange.createMarketOrder(symbol.toUpperCase(), "buy", trade.size * 0.5);
+    trade.size *= 1.5; trade.entry = price;
+  }
+  if (trade.side === "SHORT" && price < trade.entry * 0.96) {
+    await exchange.createMarketOrder(symbol.toUpperCase(), "sell", trade.size * 0.5);
+    trade.size *= 1.5; trade.entry = price;
+  }
+}
+
+// ===== INDICATORS =====
+function calculateIndicators(closes, highs, lows) {
+  const emaFast = ti.EMA.calculate({ period: 7, values: closes }).at(-1);
+  const emaSlow = ti.EMA.calculate({ period: 25, values: closes }).at(-1);
+  const rsi = ti.RSI.calculate({ period: 14, values: closes }).at(-1);
+  const macd = ti.MACD.calculate({
+    values: closes,
+    fastPeriod: 8,
+    slowPeriod: 21,
+    signalPeriod: 5
+  }).at(-1);
+  const atr = ti.ATR.calculate({ high: highs, low: lows, close: closes, period: 14 }).at(-1);
+  const price = closes.at(-1);
+  return { emaFast, emaSlow, rsi, macd, atr, price };
+}
+
+function signal(ind) {
+  if (!ind.macd) return null;
+  if (ind.emaFast > ind.emaSlow && ind.rsi > 48 && ind.macd.MACD > ind.macd.signal) return "LONG";
+  if (ind.emaFast < ind.emaSlow && ind.rsi < 52 && ind.macd.MACD < ind.macd.signal) return "SHORT";
+  return null;
+}
+
+// ===== WEBSOCKET =====
+SYMBOL_POOL.forEach(sym => {
+  const ws = new WebSocket(`wss://fstream.binance.com/ws/${sym}@kline_1m`);
+  let candleBuffer = [];
+
+  ws.on("message", async msg => {
+    try {
+      const data = JSON.parse(msg);
+      const k = data.k;
+      const close = parseFloat(k.c);
+      const high = parseFloat(k.h);
+      const low = parseFloat(k.l);
+      const open = parseFloat(k.o);
+
+      candleBuffer.push({ open, high, low, close });
+      if (candleBuffer.length > 150) candleBuffer.shift();
+
+      if (candleBuffer.length >= 50) {
+        const closes = candleBuffer.map(c => c.close);
+        const highs = candleBuffer.map(c => c.high);
+        const lows = candleBuffer.map(c => c.low);
+
+        const ind = calculateIndicators(closes, highs, lows);
+        const sig = signal(ind);
+        const volScore = Math.random() * 0.05 + 0.01;
+
+        if (sig && !activeTrades[sym]) await openTrade(sym, sig, ind.price, volScore);
+        await manageTrade(sym, ind.price, ind.atr);
+      }
+    } catch (e) {
+      console.log(`ERROR WS ${sym}:`, e.message);
+    }
+  });
+
+  ws.on("error", e => console.log(`WS ERROR ${sym}:`, e.message));
+  ws.on("close", () => console.log(`WS CLOSED ${sym}`));
+});
+
+console.log("🔥 LIVE AGGRESSIVE WS BOT STARTED AUTOMATICALLY");
