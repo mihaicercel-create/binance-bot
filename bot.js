@@ -46,11 +46,11 @@ async function initialize() {
       const amount = balance.total[currency];
       console.log(`  ${currency}: ${amount}`);
       
-      if (currency === 'USDT') {
+      if (currency === 'USDC') {
         totalUSDT += amount;
       } else {
         try {
-          const ticker = await exchange.fetchTicker(`${currency}/USDT`);
+          const ticker = await exchange.fetchTicker(`${currency}/USDC`);
           const value = amount * ticker.last;
           totalUSDT += value;
         } catch (e) {
@@ -59,10 +59,10 @@ async function initialize() {
       }
     }
     
-    console.log(`\n💵 Total Value: ~${totalUSDT.toFixed(2)} USDT\n`);
+    console.log(`\n💵 Total Value: ~${totalUSDC.toFixed(2)} USDC\n`);
     
-    if (totalUSDT < 100) {
-      console.log('⚠️  Capital too low. Need at least 100 USDT.');
+    if (totalUSDC < 100) {
+      console.log('⚠️  Capital too low. Need at least 100 USDC.');
       return false;
     }
     
@@ -82,9 +82,9 @@ async function executeTradingCycle() {
     console.log(`\n[${new Date().toISOString()}] Running trading cycle...`);
     
     const balance = await exchange.fetchBalance();
-    const usdtBalance = balance.free.USDT || 0;
+    const usdtBalance = balance.free.USDC || 0;
     
-    console.log(`Available USDT: ${usdtBalance.toFixed(2)}`);
+    console.log(`Available USDC: ${usdcBalance.toFixed(2)}`);
     
     const tickers = await exchange.fetchTickers(['BTC/USDT', 'ETH/USDT', 'BNB/USDT']);
     
