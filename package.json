@@ -1,0 +1,15 @@
+{
+  "name": "binance-trading-bot",
+  "version": "1.0.0",
+  "description": "Automated crypto trading bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "ccxt": "^4.2.25"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
