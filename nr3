@@ -1,0 +1,277 @@
+require("dotenv").config();
+const ccxt = require("ccxt");
+const ti = require("technicalindicators");
+
+const exchange = new ccxt.binanceusdm({
+  apiKey: process.env.BINANCE_API_KEY,
+  secret: process.env.BINANCE_API_SECRET,
+  enableRateLimit: true,
+  options: { defaultType: "future" }
+});
+
+// ===== CONFIG AGGRESSIVE =====
+
+const SYMBOL_POOL = [
+  "BTC/USDC",
+  "ETH/USDC",
+  "SOL/USDC",
+  "BNB/USDC"
+];
+
+const CHECK_INTERVAL = 120000;
+
+const BASE_LEVERAGE = 6;
+const MAX_LEVERAGE = 12;
+
+const RISK = 0.05;
+const MAX_POSITIONS = 4;
+
+let activeTrades = {};
+let peakBalance = 0;
+
+// ===== BALANCE =====
+
+async function balance() {
+  const b = await exchange.fetchBalance();
+  return b.total.USDC || 0;
+}
+
+// ===== VOLATILITY SCANNER =====
+
+async function scanVolatility() {
+  let scores = [];
+
+  for (let sym of SYMBOL_POOL) {
+    const candles = await exchange.fetchOHLCV(sym, "5m", undefined, 50);
+    const closes = candles.map(c => c[4]);
+
+    const atr = ti.ATR.calculate({
+      high: candles.map(c => c[2]),
+      low: candles.map(c => c[3]),
+      close: closes,
+      period: 14
+    });
+
+    scores.push({
+      symbol: sym,
+      score: atr.at(-1) / closes.at(-1)
+    });
+  }
+
+  scores.sort((a,b)=>b.score-a.score);
+  return scores.slice(0, MAX_POSITIONS).map(s=>s.symbol);
+}
+
+// ===== INDICATORS =====
+
+function indicators(candles) {
+  const closes = candles.map(c=>c[4]);
+
+  return {
+    price: closes.at(-1),
+    emaFast: ti.EMA.calculate({period:7,values:closes}).at(-1),
+    emaSlow: ti.EMA.calculate({period:25,values:closes}).at(-1),
+    rsi: ti.RSI.calculate({period:14,values:closes}).at(-1),
+    macd: ti.MACD.calculate({
+      values: closes,
+      fastPeriod: 8,
+      slowPeriod: 21,
+      signalPeriod: 5
+    }).at(-1)
+  };
+}
+
+// ===== MULTI TIMEFRAME CONFIRM =====
+
+async function confirmTrend(symbol, side) {
+  const candles = await exchange.fetchOHLCV(symbol,"15m",undefined,80);
+  const closes = candles.map(c=>c[4]);
+
+  const ema = ti.EMA.calculate({period:50,values:closes}).at(-1);
+  const price = closes.at(-1);
+
+  if (side === "LONG") return price > ema;
+  if (side === "SHORT") return price < ema;
+
+  return false;
+}
+
+// ===== SIGNAL =====
+
+function signal(ind) {
+
+  if (!ind.macd) return null;
+
+  if (
+    ind.emaFast > ind.emaSlow &&
+    ind.rsi > 48 &&
+    ind.macd.MACD > ind.macd.signal
+  ) return "LONG";
+
+  if (
+    ind.emaFast < ind.emaSlow &&
+    ind.rsi < 52 &&
+    ind.macd.MACD < ind.macd.signal
+  ) return "SHORT";
+
+  return null;
+}
+
+// ===== LEVERAGE ADAPTIV =====
+
+function adaptiveLeverage(volScore) {
+  let lev = BASE_LEVERAGE + Math.floor(volScore * 100);
+  return Math.min(lev, MAX_LEVERAGE);
+}
+
+// ===== SIZE =====
+
+async function positionSize(price, leverage) {
+  const bal = await balance();
+
+  if (bal > peakBalance) peakBalance = bal;
+
+  const riskAmount = bal * RISK;
+  return (riskAmount * leverage) / price;
+}
+
+// ===== OPEN TRADE =====
+
+async function openTrade(symbol, side, ind, volScore) {
+
+  if (activeTrades[symbol]) return;
+
+  const confirmed = await confirmTrend(symbol, side);
+  if (!confirmed) return;
+
+  const lev = adaptiveLeverage(volScore);
+  await exchange.setLeverage(lev, symbol.replace("/",""));
+
+  const size = await positionSize(ind.price, lev);
+
+  const orderSide = side === "LONG" ? "buy" : "sell";
+
+  await exchange.createMarketOrder(symbol, orderSide, size);
+
+  activeTrades[symbol] = {
+    side,
+    entry: ind.price,
+    peak: ind.price,
+    size,
+    leverage: lev
+  };
+
+  console.log(`OPEN ${side} ${symbol} lev:${lev}`);
+}
+
+// ===== PYRAMIDING =====
+
+async function pyramid(symbol, price) {
+
+  const trade = activeTrades[symbol];
+  if (!trade) return;
+
+  if (trade.side === "LONG" && price > trade.entry * 1.04) {
+    await exchange.createMarketOrder(symbol,"buy",trade.size*0.5);
+    trade.size *= 1.5;
+    trade.entry = price;
+  }
+
+  if (trade.side === "SHORT" && price < trade.entry * 0.96) {
+    await exchange.createMarketOrder(symbol,"sell",trade.size*0.5);
+    trade.size *= 1.5;
+    trade.entry = price;
+  }
+}
+
+// ===== ATR TRAILING =====
+
+async function trailing(symbol, price, candles) {
+
+  const trade = activeTrades[symbol];
+  if (!trade) return;
+
+  const atr = ti.ATR.calculate({
+    high: candles.map(c=>c[2]),
+    low: candles.map(c=>c[3]),
+    close: candles.map(c=>c[4]),
+    period: 14
+  }).at(-1);
+
+  const trail = atr * 2;
+
+  if (trade.side === "LONG") {
+
+    if (price > trade.peak) trade.peak = price;
+
+    if (price <= trade.peak - trail)
+      await closeTrade(symbol);
+  }
+
+  if (trade.side === "SHORT") {
+
+    if (price < trade.peak) trade.peak = price;
+
+    if (price >= trade.peak + trail)
+      await closeTrade(symbol);
+  }
+}
+
+// ===== CLOSE =====
+
+async function closeTrade(symbol) {
+
+  const trade = activeTrades[symbol];
+  if (!trade) return;
+
+  const side = trade.side === "LONG" ? "sell" : "buy";
+
+  await exchange.createMarketOrder(symbol, side, trade.size);
+
+  delete activeTrades[symbol];
+
+  console.log(`CLOSE ${symbol}`);
+}
+
+// ===== MAIN =====
+
+async function processSymbol(symbol, volScore) {
+
+  const candles = await exchange.fetchOHLCV(symbol,"5m",undefined,120);
+  const ind = indicators(candles);
+
+  await trailing(symbol, ind.price, candles);
+  await pyramid(symbol, ind.price);
+
+  if (!activeTrades[symbol]) {
+    const sig = signal(ind);
+    if (sig) await openTrade(symbol, sig, ind, volScore);
+  }
+}
+
+async function runBot() {
+
+  console.log("AGGRESSIVE BOT STARTED");
+
+  while(true) {
+
+    try {
+
+      const volatileCoins = await scanVolatility();
+
+      for (let sym of volatileCoins) {
+
+        const volScore = Math.random()*0.05 + 0.01;
+        await processSymbol(sym, volScore);
+
+      }
+
+    } catch(e) {
+      console.log(e.message);
+    }
+
+    await new Promise(r=>setTimeout(r,CHECK_INTERVAL));
+  }
+}
+
+runBot();
